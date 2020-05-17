@@ -10,6 +10,16 @@ const log = debugModule('demo-app');
 const warn = debugModule('demo-app:WARN');
 const err = debugModule('demo-app:ERROR');
 
+document.addEventListener("DOMContentLoaded", () => {
+  setTimeout(() => joinRoom(), 0);
+});
+
+function nextTick() {
+  return new Promise(resolve => {
+    setTimeout(resolve, 0);
+  });
+}
+
 
 //
 // export all the references we use internally to manage call state,
@@ -81,6 +91,29 @@ export async function joinRoom() {
     return;
   }
 
+  const audioEl = document.createElement("audio");
+  let audioInput;
+
+  // Wait for startup to render form
+  do {
+    audioInput = document.querySelector("#bot-audio-input");
+    await nextTick();
+  } while (!audioInput);
+
+  const getAudio = () => {
+    audioEl.loop = true;
+    audioEl.muted = true;
+    audioEl.crossorigin = "anonymous";
+    audioEl.src = URL.createObjectURL(audioInput.files[0]);
+    document.body.appendChild(audioEl);
+  };
+
+  if (audioInput.files && audioInput.files.length > 0) {
+    getAudio();
+  } else {
+    audioInput.onchange = getAudio;
+  }
+
   // super-simple signaling: let's poll at 1-second intervals
   pollingInterval = setInterval(async () => {
     let { error } = await pollAndUpdate();
@@ -89,6 +122,28 @@ export async function joinRoom() {
       err(error);
     }
   }, 1000);
+
+	audioEl.addEventListener("canplay", async () => {
+    const track = audioEl.captureStream
+        ? audioEl.captureStream().getAudioTracks()[0]
+        : audioEl.mozCaptureStream
+          ? audioEl.mozCaptureStream().getAudioTracks()[0]
+          : null;
+
+    if (!sendTransport) {
+      sendTransport = await createTransport('send');
+    }
+
+					console.log("Sendinga udio");
+		console.log(track);
+    camAudioProducer = await sendTransport.produce({
+      track: track,
+      appData: { mediaTag: 'cam-audio' }
+    });
+
+    audioEl.play();
+		console.log(track);
+	});
 }
 
 export async function sendCameraStreams() {
@@ -545,6 +600,8 @@ async function createTransport(direction) {
       } else if (appData.mediaTag === 'cam-audio') {
         paused = getMicPausedState();
       }
+	    console.log("paused: " + paused);
+
       // tell the server what it needs to know from us in order to set
       // up a server-side producer object, and get back a
       // producer.id. call callback() on success or errback() on
@@ -608,6 +665,20 @@ async function pollAndUpdate() {
       lastPeersList = sortPeers(lastPollSyncData);
   if (!deepEqual(thisPeersList, lastPeersList)) {
     updatePeersDisplay(peers, thisPeersList);
+
+    // Subscribe immediately to all tracks
+    for (let peer of thisPeersList) {
+      if (peer.id === myPeerId) continue;
+
+      for (let [mediaTag, info] of Object.entries(peer.media)) {
+        const peerId = peer.id;
+        const consumer = findConsumerForTrack(peerId, mediaTag);
+
+        if (!consumer) {
+          subscribeToTrack(peerId, mediaTag);
+        }
+      }
+    }
   }
 
   // if a peer has gone away, we need to close all consumers we have
@@ -838,6 +909,7 @@ function addVideoAudio(consumer) {
   $(`#remote-${consumer.kind}`).appendChild(el);
   el.srcObject = new MediaStream([ consumer.track.clone() ]);
   el.consumer = consumer;
+				console.log(el);
   // let's "yield" and return before playing, rather than awaiting on
   // play() succeeding. play() will not succeed on a producer-paused
   // track until the producer unpauses.
@@ -1086,3 +1158,4 @@ function uuidv4() {
 async function sleep(ms) {
   return new Promise((r) => setTimeout(() => r(), ms));
 }
+
