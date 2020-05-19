@@ -14,19 +14,23 @@ const err = debugModule('demo-app:ERROR');
 
 // one mediasoup worker and router
 //
-let worker, router, audioLevelObserver;
+let workers, routers, audioLevelObservers;
 
 //
 // and one "room" ...
 //
-const roomState = {
-  // external
-  peers: {},
-  activeSpeaker: { producerId: null, volume: null, peerId: null },
-  // internal
-  transports: {},
-  producers: [],
-  consumers: []
+const roomStates = [];
+
+for (let i = 0; i < 9; i++) {
+  roomStates.push({
+    // external
+    peers: {},
+    activeSpeaker: { producerId: null, volume: null, peerId: null },
+    // internal
+    transports: {},
+    producers: [],
+    consumers: []
+  });
 }
 //
 // for each peer that connects, we keep a table of peers and what
@@ -89,7 +93,7 @@ expressApp.use(express.static(__dirname));
 async function main() {
   // start mediasoup
   console.log('starting mediasoup');
-  ({ worker, router, audioLevelObserver } = await startMediasoup());
+  ({ workers, routers, audioLevelObservers } = await startMediasoup());
 
   // start https server, falling back to http if https fails
   console.log('starting express');
@@ -125,17 +129,20 @@ async function main() {
   // a final "beacon"
   setInterval(() => {
     let now = Date.now();
-    Object.entries(roomState.peers).forEach(([id, p]) => {
-      if ((now - p.lastSeenTs) > config.httpPeerStale) {
-        warn(`removing stale peer ${id}`);
-        closePeer(id);
-      }
+    roomStates.forEach(roomState => {
+      Object.entries(roomState.peers).forEach(([id, p]) => {
+        if ((now - p.lastSeenTs) > config.httpPeerStale) {
+          warn(`removing stale peer ${id}`);
+          closePeer(id);
+        }
+      });
     });
   }, 1000);
 
   // periodically update video stats we're sending to peers
   setInterval(updatePeerStats, 3000);
 }
+
 
 main();
 
@@ -145,41 +152,65 @@ main();
 //
 
 async function startMediasoup() {
-  let worker = await mediasoup.createWorker({
+  let workers = []
+
+  workers[0] = await mediasoup.createWorker({
     logLevel: config.mediasoup.worker.logLevel,
     logTags: config.mediasoup.worker.logTags,
     rtcMinPort: config.mediasoup.worker.rtcMinPort,
     rtcMaxPort: config.mediasoup.worker.rtcMaxPort,
   });
 
-  worker.on('died', () => {
-    console.error('mediasoup worker died (this should never happen)');
+  workers[1] = await mediasoup.createWorker({
+    logLevel: config.mediasoup.worker.logLevel,
+    logTags: config.mediasoup.worker.logTags,
+    rtcMinPort: config.mediasoup.worker.rtcMinPort,
+    rtcMaxPort: config.mediasoup.worker.rtcMaxPort,
+  });
+
+  workers[0].on('died', () => {
+    console.error('mediasoup worker 0 died (this should never happen)');
+    process.exit(1);
+  });
+
+  workers[0].on('died', () => {
+    console.error('mediasoup worker 1 died (this should never happen)');
     process.exit(1);
   });
 
   const mediaCodecs = config.mediasoup.router.mediaCodecs;
-  const router = await worker.createRouter({ mediaCodecs });
+  let routers = [];
+  let audioLevelObservers = [];
+
+	for (let i = 0; i < 10; i++) {
+    let router = await workers[i % 2].createRouter({ mediaCodecs });
+    routers.push(router);
+
+    const audioLevelObserver = await router.createAudioLevelObserver({
+      interval: 800
+    });
+
+    audioLevelObservers.push(audioLevelObserver);
+
+    audioLevelObserver.on('volumes', (volumes) => {
+      const { producer, volume } = volumes[0];
+      log('audio-level volumes event', producer.appData.peerId, volume);
+      roomState.activeSpeaker.producerId = producer.id;
+      roomState.activeSpeaker.volume = volume;
+      roomState.activeSpeaker.peerId = producer.appData.peerId;
+    });
+    audioLevelObserver.on('silence', () => {
+      log('audio-level silence event');
+      roomState.activeSpeaker.producerId = null;
+      roomState.activeSpeaker.volume = null;
+      roomState.activeSpeaker.peerId = null;
+    });
+  }
 
   // audioLevelObserver for signaling active speaker
   //
-  const audioLevelObserver = await router.createAudioLevelObserver({
-		interval: 800
-	});
-  audioLevelObserver.on('volumes', (volumes) => {
-    const { producer, volume } = volumes[0];
-    log('audio-level volumes event', producer.appData.peerId, volume);
-    roomState.activeSpeaker.producerId = producer.id;
-    roomState.activeSpeaker.volume = volume;
-    roomState.activeSpeaker.peerId = producer.appData.peerId;
-  });
-  audioLevelObserver.on('silence', () => {
-    log('audio-level silence event');
-    roomState.activeSpeaker.producerId = null;
-    roomState.activeSpeaker.volume = null;
-    roomState.activeSpeaker.peerId = null;
-  });
 
-  return { worker, router, audioLevelObserver };
+  return { workers, routers, audioLevelObservers };
 }
 
 //
@@ -192,6 +223,21 @@ async function startMediasoup() {
 //
 expressApp.use(express.json({ type: '*/*' }));
 
+function roomStateForReq(req) {
+  let { roomId } = req.body;
+  return roomStates[parseInt(roomId)];
+}
+
+function routerForReq(req) {
+  let { roomId } = req.body;
+  return routers[parseInt(roomId)];
+}
+
+function audioLevelObserverForReq(req) {
+  let { roomId } = req.body;
+  return audioLevelObservers[parseInt(roomId)];
+}
+
 // --> /signaling/sync
 //
 // client polling endpoint. send back our 'peers' data structure and
@@ -199,6 +245,8 @@ expressApp.use(express.json({ type: '*/*' }));
 //
 expressApp.post('/signaling/sync', async (req, res) => {
   let { peerId } = req.body;
+  const roomState = roomStateForReq(req);
+
   try {
     // make sure this peer is connected. if we've disconnected the
     // peer because of a network outage we want the peer to know that
@@ -229,8 +277,11 @@ expressApp.post('/signaling/sync', async (req, res) => {
 expressApp.post('/signaling/join-as-new-peer', async (req, res) => {
   try {
     let { peerId } = req.body,
-        now = Date.now();
+    now = Date.now();
     log('join-as-new-peer', peerId);
+
+    const router = routerForReq(req);
+    const roomState = roomStateForReq(req);
 
     roomState.peers[peerId] = {
       joinTs: now,
@@ -265,12 +316,14 @@ expressApp.post('/signaling/leave', async (req, res) => {
 
 function closePeer(peerId) {
   log('closing peer', peerId);
-  for (let [id, transport] of Object.entries(roomState.transports)) {
-    if (transport.appData.peerId === peerId) {
-      closeTransport(transport);
+  roomStates.forEach(roomState => {
+    for (let [id, transport] of Object.entries(roomState.transports)) {
+      if (transport.appData.peerId === peerId) {
+        closeTransport(transport);
+      }
     }
-  }
-  delete roomState.peers[peerId];
+    delete roomState.peers[peerId];
+  });
 }
 
 async function closeTransport(transport) {
@@ -284,7 +337,7 @@ async function closeTransport(transport) {
 
     // so all we need to do, after we call transport.close(), is update
     // our roomState data structure
-    delete roomState.transports[transport.id];
+    roomStates.forEach(roomState => delete roomState.transports[transport.id]);
   } catch (e) {
     err(e);
   }
@@ -296,14 +349,16 @@ async function closeProducer(producer) {
     await producer.close();
 
     // remove this producer from our roomState.producers list
-    roomState.producers = roomState.producers
-      .filter((p) => p.id !== producer.id);
+    roomStates.forEach(roomState => {
+      roomState.producers = roomState.producers
+        .filter((p) => p.id !== producer.id);
 
-    // remove this track's info from our roomState...mediaTag bookkeeping
-    if (roomState.peers[producer.appData.peerId]) {
-      delete (roomState.peers[producer.appData.peerId]
-              .media[producer.appData.mediaTag]);
-    }
+      // remove this track's info from our roomState...mediaTag bookkeeping
+      if (roomState.peers[producer.appData.peerId]) {
+        delete (roomState.peers[producer.appData.peerId]
+                .media[producer.appData.mediaTag]);
+      }
+    });
   } catch (e) {
     err(e);
   }
@@ -313,13 +368,15 @@ async function closeConsumer(consumer) {
   log('closing consumer', consumer.id, consumer.appData);
   await consumer.close();
 
-  // remove this consumer from our roomState.consumers list
-  roomState.consumers = roomState.consumers.filter((c) => c.id !== consumer.id);
+  roomStates.forEach(roomState => {
+    // remove this consumer from our roomState.consumers list
+    roomState.consumers = roomState.consumers.filter((c) => c.id !== consumer.id);
 
-  // remove layer info from from our roomState...consumerLayers bookkeeping
-  if (roomState.peers[consumer.appData.peerId]) {
-    delete roomState.peers[consumer.appData.peerId].consumerLayers[consumer.id];
-  }
+    // remove layer info from from our roomState...consumerLayers bookkeeping
+    if (roomState.peers[consumer.appData.peerId]) {
+      delete roomState.peers[consumer.appData.peerId].consumerLayers[consumer.id];
+    }
+  });
 }
 
 
@@ -333,7 +390,10 @@ expressApp.post('/signaling/create-transport', async (req, res) => {
     let { peerId, direction } = req.body;
     log('create-transport', peerId, direction);
 
-    let transport = await createWebRtcTransport({ peerId, direction });
+    const router = routerForReq(req);
+    const roomState = roomStateForReq(req);
+
+    let transport = await createWebRtcTransport({ peerId, router, direction });
     roomState.transports[transport.id] = transport;
 
     let { id, iceParameters, iceCandidates, dtlsParameters } = transport;
@@ -346,7 +406,7 @@ expressApp.post('/signaling/create-transport', async (req, res) => {
   }
 });
 
-async function createWebRtcTransport({ peerId, direction }) {
+async function createWebRtcTransport({ peerId, router, direction }) {
   const {
     listenIps,
     initialAvailableOutgoingBitrate
@@ -371,8 +431,10 @@ async function createWebRtcTransport({ peerId, direction }) {
 //
 expressApp.post('/signaling/connect-transport', async (req, res) => {
   try {
+    const roomState = roomStateForReq(req);
+
     let { peerId, transportId, dtlsParameters } = req.body,
-        transport = roomState.transports[transportId];
+    transport = roomState.transports[transportId];
 
     if (!transport) {
       err(`connect-transport: server-side transport ${transportId} not found`);
@@ -397,8 +459,9 @@ expressApp.post('/signaling/connect-transport', async (req, res) => {
 //
 expressApp.post('/signaling/close-transport', async (req, res) => {
   try {
+    const roomState = roomStateForReq(req);
     let { peerId, transportId } = req.body,
-        transport = roomState.transports[transportId];
+    transport = roomState.transports[transportId];
 
     if (!transport) {
       err(`close-transport: server-side transport ${transportId} not found`);
@@ -422,8 +485,9 @@ expressApp.post('/signaling/close-transport', async (req, res) => {
 //
 expressApp.post('/signaling/close-producer', async (req, res) => {
   try {
+    const roomState = roomStateForReq(req);
     let { peerId, producerId } = req.body,
-        producer = roomState.producers.find((p) => p.id === producerId);
+    producer = roomState.producers.find((p) => p.id === producerId);
 
     if (!producer) {
       err(`close-producer: server-side producer ${producerId} not found`);
@@ -448,9 +512,10 @@ expressApp.post('/signaling/close-producer', async (req, res) => {
 //
 expressApp.post('/signaling/send-track', async (req, res) => {
   try {
+    const roomState = roomStateForReq(req);
     let { peerId, transportId, kind, rtpParameters,
           paused=false, appData } = req.body,
-        transport = roomState.transports[transportId];
+    transport = roomState.transports[transportId];
 
     if (!transport) {
       err(`send-track: server-side transport ${transportId} not found`);
@@ -475,7 +540,7 @@ expressApp.post('/signaling/send-track', async (req, res) => {
     // but we don't ever need to call removeProducer() because the core
     // AudioLevelObserver code automatically removes closed producers
     if (producer.kind === 'audio') {
-      audioLevelObserver.addProducer({ producerId: producer.id });
+      audioLevelObserverForReq(req).addProducer({ producerId: producer.id });
     }
 
     roomState.producers.push(producer);
@@ -498,6 +563,8 @@ expressApp.post('/signaling/send-track', async (req, res) => {
 //
 expressApp.post('/signaling/recv-track', async (req, res) => {
   try {
+    const roomState = roomStateForReq(req);
+    const router = routerForReq(req);
     let { peerId, mediaPeerId, mediaTag, rtpCapabilities } = req.body;
 
     let producer = roomState.producers.find(
@@ -532,6 +599,14 @@ expressApp.post('/signaling/recv-track', async (req, res) => {
       return;
     }
 
+    if (!roomState.peers[peerId]) {
+      let msg = `${peerId} not found`;
+      err('recv-track: ' + msg);
+      res.send({ error: msg });
+		  return;
+		}
+
+
     let consumer = await transport.consume({
       producerId: producer.id,
       rtpCapabilities,
@@ -550,16 +625,6 @@ expressApp.post('/signaling/recv-track', async (req, res) => {
       log(`consumer's producer closed`, consumer.id);
       closeConsumer(consumer);
     });
-
-    // stick this consumer in our list of consumers to keep track of,
-    // and create a data structure to track the client-relevant state
-    // of this consumer
-    roomState.consumers.push(consumer);
-    roomState.peers[peerId].consumerLayers[consumer.id] = {
-      currentLayer: null,
-      clientSelectedLayer: null
-    };
-
     // update above data structure when layer changes.
     consumer.on('layerschange', (layers) => {
       log(`consumer layerschange ${mediaPeerId}->${peerId}`, mediaTag, layers);
@@ -569,6 +634,23 @@ expressApp.post('/signaling/recv-track', async (req, res) => {
           .currentLayer = layers && layers.spatialLayer;
       }
     });
+
+    // stick this consumer in our list of consumers to keep track of,
+    // and create a data structure to track the client-relevant state
+    // of this consumer
+    roomState.consumers.push(consumer);
+
+	  if (roomState.peers[peerId]) {
+      roomState.peers[peerId].consumerLayers[consumer.id] = {
+        currentLayer: null,
+        clientSelectedLayer: null
+      };
+		} else {
+      let msg = `${peerId} not found`;
+      err('recv-track: ' + msg);
+      res.send({ error: msg });
+		  return;
+		}
 
     res.send({
       producerId: producer.id,
@@ -590,8 +672,10 @@ expressApp.post('/signaling/recv-track', async (req, res) => {
 //
 expressApp.post('/signaling/pause-consumer', async (req, res) => {
   try {
+    const roomState = roomStateForReq(req);
+    const router = routerForReq(req);
     let { peerId, consumerId } = req.body,
-        consumer = roomState.consumers.find((c) => c.id === consumerId);
+    consumer = roomState.consumers.find((c) => c.id === consumerId);
 
     if (!consumer) {
       err(`pause-consumer: server-side consumer ${consumerId} not found`);
@@ -616,8 +700,10 @@ expressApp.post('/signaling/pause-consumer', async (req, res) => {
 //
 expressApp.post('/signaling/resume-consumer', async (req, res) => {
   try {
+    const roomState = roomStateForReq(req);
+    const router = routerForReq(req);
     let { peerId, consumerId } = req.body,
-        consumer = roomState.consumers.find((c) => c.id === consumerId);
+    consumer = roomState.consumers.find((c) => c.id === consumerId);
 
     if (!consumer) {
       err(`pause-consumer: server-side consumer ${consumerId} not found`);
@@ -643,8 +729,10 @@ expressApp.post('/signaling/resume-consumer', async (req, res) => {
 //
 expressApp.post('/signaling/close-consumer', async (req, res) => {
   try {
-  let { peerId, consumerId } = req.body,
-      consumer = roomState.consumers.find((c) => c.id === consumerId);
+    const roomState = roomStateForReq(req);
+    const router = routerForReq(req);
+    let { peerId, consumerId } = req.body,
+    consumer = roomState.consumers.find((c) => c.id === consumerId);
 
     if (!consumer) {
       err(`close-consumer: server-side consumer ${consumerId} not found`);
@@ -668,8 +756,10 @@ expressApp.post('/signaling/close-consumer', async (req, res) => {
 //
 expressApp.post('/signaling/consumer-set-layers', async (req, res) => {
   try {
+    const roomState = roomStateForReq(req);
+    const router = routerForReq(req);
     let { peerId, consumerId, spatialLayer } = req.body,
-        consumer = roomState.consumers.find((c) => c.id === consumerId);
+    consumer = roomState.consumers.find((c) => c.id === consumerId);
 
     if (!consumer) {
       err(`consumer-set-layers: server-side consumer ${consumerId} not found`);
@@ -694,8 +784,10 @@ expressApp.post('/signaling/consumer-set-layers', async (req, res) => {
 //
 expressApp.post('/signaling/pause-producer', async (req, res) => {
   try {
+    const roomState = roomStateForReq(req);
+    const router = routerForReq(req);
     let { peerId, producerId } = req.body,
-        producer = roomState.producers.find((p) => p.id === producerId);
+    producer = roomState.producers.find((p) => p.id === producerId);
 
     if (!producer) {
       err(`pause-producer: server-side producer ${producerId} not found`);
@@ -722,8 +814,10 @@ expressApp.post('/signaling/pause-producer', async (req, res) => {
 //
 expressApp.post('/signaling/resume-producer', async (req, res) => {
   try {
+    const roomState = roomStateForReq(req);
+    const router = routerForReq(req);
     let { peerId, producerId } = req.body,
-        producer = roomState.producers.find((p) => p.id === producerId);
+    producer = roomState.producers.find((p) => p.id === producerId);
 
     if (!producer) {
       err(`resume-producer: server-side producer ${producerId} not found`);
@@ -749,40 +843,42 @@ expressApp.post('/signaling/resume-producer', async (req, res) => {
 //
 
 async function updatePeerStats() {
-  for (let producer of roomState.producers) {
-    if (producer.kind !== 'video') {
-      continue;
-    }
-    try {
-      let stats = await producer.getStats(),
-          peerId = producer.appData.peerId;
-      roomState.peers[peerId].stats[producer.id] = stats.map((s) => ({
-        bitrate: s.bitrate,
-        fractionLost: s.fractionLost,
-        jitter: s.jitter,
-        score: s.score,
-        rid: s.rid
-      }));
-    } catch (e) {
-      warn('error while updating producer stats', e);
-    }
-  }
-
-  for (let consumer of roomState.consumers) {
-    try {
-      let stats = (await consumer.getStats())
-                    .find((s) => s.type === 'outbound-rtp'),
-          peerId = consumer.appData.peerId;
-      if (!stats || !roomState.peers[peerId]) {
+  roomStates.forEach(async roomState => {
+    for (let producer of roomState.producers) {
+      if (producer.kind !== 'video') {
         continue;
       }
-      roomState.peers[peerId].stats[consumer.id] = {
-        bitrate: stats.bitrate,
-        fractionLost: stats.fractionLost,
-        score: stats.score
+      try {
+        let stats = await producer.getStats(),
+            peerId = producer.appData.peerId;
+        roomState.peers[peerId].stats[producer.id] = stats.map((s) => ({
+          bitrate: s.bitrate,
+          fractionLost: s.fractionLost,
+          jitter: s.jitter,
+          score: s.score,
+          rid: s.rid
+        }));
+      } catch (e) {
+        warn('error while updating producer stats', e);
       }
-    } catch (e) {
-      warn('error while updating consumer stats', e);
     }
-  }
+
+    for (let consumer of roomState.consumers) {
+      try {
+        let stats = (await consumer.getStats())
+                      .find((s) => s.type === 'outbound-rtp'),
+            peerId = consumer.appData.peerId;
+        if (!stats || !roomState.peers[peerId]) {
+          continue;
+        }
+        roomState.peers[peerId].stats[consumer.id] = {
+          bitrate: stats.bitrate,
+          fractionLost: stats.fractionLost,
+          score: stats.score
+        }
+      } catch (e) {
+        warn('error while updating consumer stats', e);
+      }
+    }
+  });
 }

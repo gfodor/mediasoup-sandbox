@@ -675,7 +675,7 @@ async function pollAndUpdate() {
         const consumer = findConsumerForTrack(peerId, mediaTag);
 
         if (!consumer) {
-          subscribeToTrack(peerId, mediaTag);
+          await subscribeToTrack(peerId, mediaTag);
         }
       }
     }
